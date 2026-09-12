@@ -38,6 +38,31 @@
       "description": "启用论坛话题模式 (需要管理员聊天为论坛群组)",
       "example": "true",
       "required": false
+    },
+    "ENABLE_CAPTCHA": {
+      "type": "plain",
+      "description": "启用Emoji序列人机验证 (默认开启，设为 false 可关闭)",
+      "example": "true",
+      "required": false
+    },
+    "CAPTCHA_SECRET": {
+      "type": "secret",
+      "description": "人机验证签名密钥 (可选，默认复用 USER_ID_SECRET)",
+      "example": "your-captcha-secret-key",
+      "required": false,
+      "recommended": true
+    },
+    "CAPTCHA_TIMEOUT_SECONDS": {
+      "type": "plain",
+      "description": "人机验证限时秒数 (默认 180)",
+      "example": "180",
+      "required": false
+    },
+    "CAPTCHA_VERIFY_TTL_HOURS": {
+      "type": "plain",
+      "description": "验证通过后的有效小时数 (默认 720)",
+      "example": "720",
+      "required": false
     }
   },
   "kv_namespaces": {

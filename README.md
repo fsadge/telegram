@@ -91,6 +91,7 @@ graph TB
 - ✅ **群发消息功能**
 - ✅ **用户跟踪管理**
 - ✅ **论坛话题模式**
+- ✅ **Emoji序列人机验证**
 
 </td>
 <td width="50%">
@@ -103,6 +104,7 @@ graph TB
 - ✅ **可选KV存储支持**
 - ✅ **批量处理与限速**
 - ✅ **论坛话题自动管理**
+- ✅ **验证防刷与冷却锁定**
 
 </td>
 </tr>
@@ -223,6 +225,8 @@ WEBHOOK_SECRET=your-random-secret-key
 USER_ID_SECRET=your-user-id-secret-key
 ENABLE_USER_TRACKING=true
 ENABLE_FORUM_MODE=true  # 启用论坛话题模式（可选）
+ENABLE_CAPTCHA=true     # 启用Emoji人机验证（默认开启，可设为 false 关闭）
+CAPTCHA_SECRET=your-captcha-secret-key  # 人机验证签名密钥（可选，默认复用 USER_ID_SECRET）
 ```
 
 **第4步: 设置Webhook**
@@ -399,10 +403,15 @@ Use this token to access the HTTP API:
    | `ENABLE_USER_TRACKING` | 启用用户跟踪 | ❌ 可选 | `true` |
    | `USER_ID_SECRET` | 用户ID签名密钥 | ⚠️ 推荐 | `your-security-key` |
    | `ENABLE_FORUM_MODE` | 启用论坛话题模式 | ❌ 可选 | `true` |
+   | `ENABLE_CAPTCHA` | 启用Emoji人机验证（默认开启） | ❌ 可选 | `true` |
+   | `CAPTCHA_SECRET` | 人机验证签名密钥（默认复用 `USER_ID_SECRET`） | ⚠️ 推荐 | `your-captcha-secret` |
+   | `CAPTCHA_TIMEOUT_SECONDS` | 验证限时秒数 | ❌ 可选 | `180` |
+   | `CAPTCHA_VERIFY_TTL_HOURS` | 验证通过后的有效小时数 | ❌ 可选 | `720` |
 
    > 🔐 **安全提示**: 
    > - `USER_ID_SECRET` 用于防止用户身份伪造攻击，强烈建议设置
    > - `WEBHOOK_SECRET` 用于验证Webhook请求来源
+   > - `ENABLE_CAPTCHA` 默认为开启，未通过验证的用户消息不会转发给管理员
    > - 密钥应使用随机生成的强密码
 
 4. **绑定KV存储** (可选，用于用户跟踪)
@@ -521,7 +530,9 @@ Use this token to access the HTTP API:
 ### 👤 用户端操作
 
 ```bash
-/start                    # 开始对话，显示欢迎信息
+/start                    # 开始对话，触发人机验证
+按顺序点击Emoji           # 在180秒内按目标序列依次点击九宫格按钮
+/verify                   # 验证超时或失败后重新获取验证
 发送任意消息               # 自动转发给管理员
 等待管理员回复             # 收到管理员的回复消息
 ```
@@ -533,6 +544,7 @@ Use this token to access the HTTP API:
 /status                   # 查看机器人运行状态  
 /help                     # 获取帮助信息
 /users                    # 查看用户列表（需启用用户跟踪）
+/reset 123456789          # 重置指定用户的验证状态与失败锁定
 回复转发的消息             # 直接回复给对应用户
 
 # 📢 群发功能
@@ -555,6 +567,8 @@ Use this token to access the HTTP API:
 | `/help` | 管理员 | 显示详细帮助信息 |
 | `/post` | 管理员 | **群发消息功能** |
 | `/users` | 管理员 | **查看用户列表** |
+| `/reset` | 管理员 | **重置用户人机验证状态与锁定** |
+| `/verify` | 用户 | **重新获取人机验证** |
 
 ## 📁 项目结构
 
@@ -579,6 +593,33 @@ cftgsx/
 | `/` | GET | 健康检查 |
 
 ## 🛡️ 安全说明
+
+### 🤖 人机验证（防广告机器人）
+
+为拦截广告/刷屏机器人，机器人默认开启 **Emoji序列点击验证**：用户首次联系时收到九宫格 Emoji 按钮，需在限时内按提示的目标序列从左往右依次点击，验证通过前的任何消息都不会转发给管理员。
+
+```
+🤖 人机验证
+请在 180 秒内按照下面目标序列从左往右依次点击：
+
+🤼 ⭕ 🎪
+```
+
+**验证机制的防刷设计**
+
+| 机制 | 说明 |
+|:-----|:-----|
+| 限时 | 默认 180 秒（`CAPTCHA_TIMEOUT_SECONDS`），超时需重新验证 |
+| 顺序校验 | 必须按目标序列顺序点击，点错即重新出题 |
+| 签名令牌 | 题目与进度由随机 nonce 派生并用 HMAC-SHA256 签名，无法伪造或篡改 |
+| 冷却锁定 | 连续答错 5 次锁定 15 分钟，期间不再出题 |
+| 机器人过滤 | 直接丢弃其他机器人账号（`is_bot`）发来的消息 |
+| 用户隔离 | 验证按钮仅限发起者在私聊内点击 |
+| 状态持久化 | 验证结果默认有效 720 小时（`CAPTCHA_VERIFY_TTL_HOURS`），写入 KV 的 `captcha:*` 键 |
+
+> 💡 **建议绑定 KV 存储**：验证状态与失败计数保存在 KV（`USER_STORAGE`）。未绑定时会降级为实例内存，Worker 实例重启后用户需要重新验证（日志中会给出提示）。
+>
+> 🚫 **如需关闭**：设置 `ENABLE_CAPTCHA=false` 即可恢复为不验证的原始行为。
 
 ### 🔐 身份验证安全
 
@@ -823,7 +864,17 @@ Workers → 你的Worker → Logs 标签
 
 ## 📝 更新日志
 
-### v1.2.3 (Latest) - 🎨 用户链接排版优化
+### v1.3.0 (Latest) - 🤖 Emoji序列人机验证
+- ✨ **新增人机验证**: 九宫格 Emoji 内联按钮 + 目标序列点击，替代原有“无验证”状态，拦截广告机器人
+- ⏱️ **限时验证**: 默认 180 秒内需按序列从左往右依次点击，超时自动失效
+- 🛡️ **防刷机制**: 连续答错 5 次锁定 15 分钟；其他机器人账号消息直接丢弃
+- 🔐 **无状态签名令牌**: 题目与进度由随机 nonce 派生并做 HMAC-SHA256 签名，回调数据自带过期时间且无法伪造
+- 💾 **验证状态持久化**: 验证结果写入 KV（`captcha:*`），默认有效 720 小时；未绑定 KV 时降级为实例内存
+- 🔧 **新增配置**: `ENABLE_CAPTCHA`、`CAPTCHA_SECRET`、`CAPTCHA_TIMEOUT_SECONDS`、`CAPTCHA_VERIFY_TTL_HOURS`
+- 🛠️ **新增管理员命令**: `/reset 用户ID` 重置指定用户的验证状态与锁定
+- 🧪 **本地验证**: 50 项自动化检查覆盖验证流程、超时、篡改、锁定与回归场景
+
+### v1.2.3 - 🎨 用户链接排版优化
 - 🔗 **修复链接渲染**: 移除等宽字体包装，确保用户链接可正常点击跳转
 - 🎨 **优化显示格式**: 使用"📍 *来源:*"标签替代原反引号包装，提升消息可读性
 - 💫 **改进用户体验**: 管理员现在可以直接点击用户链接查看用户信息或跳转对话

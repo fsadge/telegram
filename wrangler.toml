@@ -17,8 +17,12 @@ name = "cftgsx-dev"
 # USER_ID_SECRET = "your_user_id_secret"
 # ENABLE_USER_TRACKING = "true"
 # ENABLE_FORUM_MODE = "true"  # 启用论坛话题模式（需要管理员聊天为论坛群组）
+# ENABLE_CAPTCHA = "true"     # 启用Emoji序列人机验证（默认开启，设为 "false" 关闭）
+# CAPTCHA_SECRET = "your-captcha-secret"        # 人机验证签名密钥（默认复用 USER_ID_SECRET）
+# CAPTCHA_TIMEOUT_SECONDS = "180"               # 验证限时秒数（默认 180）
+# CAPTCHA_VERIFY_TTL_HOURS = "720"              # 验证通过后的有效小时数（默认 720）
 
-# KV存储绑定（可选，用于用户跟踪功能）
+# KV存储绑定（可选，用于用户跟踪功能；人机验证状态也复用该绑定）
 # [[kv_namespaces]]
 # binding = "USER_STORAGE"
 # id = "your_kv_namespace_id"

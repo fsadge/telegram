@@ -7,6 +7,10 @@
 // ENABLE_USER_TRACKING: 启用用户跟踪 (可选，需要绑定KV存储)
 // USER_ID_SECRET: 用户ID签名密钥 (建议设置，用于防止身份伪造攻击)
 // ENABLE_FORUM_MODE: 启用论坛话题模式 (可选，当管理员聊天为论坛群组时启用)
+// ENABLE_CAPTCHA: 启用Emoji序列人机验证 (可选，默认开启；设为 false 可关闭)
+// CAPTCHA_SECRET: 人机验证签名密钥 (可选，默认复用 USER_ID_SECRET)
+// CAPTCHA_TIMEOUT_SECONDS: 人机验证限时秒数 (可选，默认 180)
+// CAPTCHA_VERIFY_TTL_HOURS: 验证通过后的有效小时数 (可选，默认 720)
 
 // 常量定义
 const CONSTANTS = {
@@ -21,7 +25,21 @@ const CONSTANTS = {
   MAX_ERROR_DISPLAY: 5,
   MAX_RECENT_USERS: 20,
   USERS_DEFAULT_PAGE_SIZE: 20,
-  USERS_PAGE_SIZES: [10, 20, 50]
+  USERS_PAGE_SIZES: [10, 20, 50],
+  // 人机验证配置
+  CAPTCHA_POOL: [
+    '🤼', '🎪', '🦶', '🫁', '🪵', '💌', '🎈', '🍎', '🚀', '🐱',
+    '🐶', '🌸', '🍕', '🎁', '🔔', '🐟', '🌙', '🍀', '🧩', '🎩',
+    '🎯', '🍭', '🦄', '🐢', '🎸', '🔑', '🌵', '🍄', '🐧', '🎃'
+  ],
+  CAPTCHA_GRID_SIZE: 9,
+  CAPTCHA_GRID_COLUMNS: 3,
+  CAPTCHA_TARGET_COUNT: 3,
+  CAPTCHA_DEFAULT_TIMEOUT_SECONDS: 180,
+  CAPTCHA_DEFAULT_TTL_HOURS: 720,
+  CAPTCHA_DEFAULT_FAIL_WINDOW_SECONDS: 600,
+  CAPTCHA_MAX_FAILURES: 5,
+  CAPTCHA_LOCKOUT_SECONDS: 900
 };
 
 // 验证环境变量
@@ -810,6 +828,517 @@ async function answerCallbackQuery(callbackQueryId, botToken, text = '', showAle
   }
 }
 
+// ==================== 人机验证（Emoji 序列点击验证） ====================
+// 形式：9宫格 Emoji 内联按钮 + 目标序列，要求在限时内按序列从左往右依次点击。
+// 实现要点：
+//   1. 题库、目标序列与签名全部由随机 nonce 派生，回调数据自带签名与过期时间，天然无状态；
+//   2. 验证结果与失败次数写入 KV（USER_STORAGE），未绑定时降级为实例内存并在日志中告警；
+//   3. 连续点错达上限后触发冷却锁定，避免脚本暴力尝试。
+
+const CAPTCHA_CALLBACK_PREFIX = 'cv';
+const CAPTCHA_TOKEN_VERSION = 1;
+const CAPTCHA_NONCE_BYTES = 6;
+const CAPTCHA_MAC_BYTES = 8;
+const CAPTCHA_SEAT_REFRESH = 'r';
+
+// 未绑定 KV 时的降级存储（仅在同一 Worker 实例内有效，重启即失效）
+const CAPTCHA_MEMORY_STORE = new Map();
+let captchaMemoryFallbackWarned = false;
+
+function isCaptchaEnabled(env) {
+  const raw = env && env.ENABLE_CAPTCHA;
+  if (raw === undefined || raw === null || raw === '') return true; // 默认开启
+  const value = String(raw).trim().toLowerCase();
+  return !['false', '0', 'off', 'no', 'disabled'].includes(value);
+}
+
+function getCaptchaSecret(env) {
+  return String(
+    (env && (env.CAPTCHA_SECRET || env.USER_ID_SECRET || env.WEBHOOK_SECRET || env.BOT_TOKEN)) ||
+    'cftgsx-captcha-secret'
+  );
+}
+
+function getCaptchaTimeoutSeconds(env) {
+  const value = parseInt(env && env.CAPTCHA_TIMEOUT_SECONDS, 10);
+  return Number.isFinite(value) && value >= 30 && value <= 3600
+    ? value
+    : CONSTANTS.CAPTCHA_DEFAULT_TIMEOUT_SECONDS;
+}
+
+function getCaptchaTtlSeconds(env) {
+  const hours = parseFloat(env && env.CAPTCHA_VERIFY_TTL_HOURS);
+  const validHours = Number.isFinite(hours) && hours > 0 && hours <= 8760
+    ? hours
+    : CONSTANTS.CAPTCHA_DEFAULT_TTL_HOURS;
+  return Math.round(validHours * 3600);
+}
+
+function captchaKey(chatId, kind) {
+  return `captcha:${kind}:${chatId}`;
+}
+
+// KV 优先、内存降级的轻量存储
+async function captchaStoreGet(key, env) {
+  if (env && env.USER_STORAGE) {
+    try {
+      const raw = await env.USER_STORAGE.get(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch (error) {
+      logError('captchaStoreGet', error, { key });
+      return null;
+    }
+  }
+
+  if (!captchaMemoryFallbackWarned) {
+    captchaMemoryFallbackWarned = true;
+    logInfo('captchaStoreGet', '未绑定 KV(USER_STORAGE)，人机验证状态将仅保存在当前实例内存中');
+  }
+
+  const entry = CAPTCHA_MEMORY_STORE.get(key);
+  if (!entry) return null;
+  if (entry.expireAt <= Date.now()) {
+    CAPTCHA_MEMORY_STORE.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+async function captchaStorePut(key, value, ttlSeconds, env) {
+  const ttl = Math.max(60, Math.round(ttlSeconds));
+
+  if (env && env.USER_STORAGE) {
+    try {
+      await env.USER_STORAGE.put(key, JSON.stringify(value), { expirationTtl: ttl });
+      return true;
+    } catch (error) {
+      logError('captchaStorePut', error, { key });
+      return false;
+    }
+  }
+
+  CAPTCHA_MEMORY_STORE.set(key, { value, expireAt: Date.now() + ttl * 1000 });
+  return true;
+}
+
+async function captchaStoreDelete(key, env) {
+  if (env && env.USER_STORAGE) {
+    try {
+      await env.USER_STORAGE.delete(key);
+    } catch (error) {
+      logError('captchaStoreDelete', error, { key });
+    }
+    return;
+  }
+  CAPTCHA_MEMORY_STORE.delete(key);
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlToBytes(text) {
+  const normalized = String(text).replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function captchaHmac(secret, messageBytes) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, messageBytes);
+  return new Uint8Array(signature);
+}
+
+// 由 nonce 派生任意长度的确定性随机流，保证同一 nonce 重建出同一套题目
+async function captchaRandomBytes(secret, nonceBytes, label, length) {
+  const labelBytes = new TextEncoder().encode(label);
+  const base = new Uint8Array(nonceBytes.length + 1 + labelBytes.length);
+  base.set(nonceBytes, 0);
+  base[nonceBytes.length] = 0x7c; // '|'
+  base.set(labelBytes, nonceBytes.length + 1);
+
+  const output = new Uint8Array(length);
+  let offset = 0;
+  let counter = 0;
+
+  while (offset < length) {
+    const message = new Uint8Array(base.length + 1);
+    message.set(base, 0);
+    message[base.length] = counter & 0xff;
+    const block = await captchaHmac(secret, message);
+    const take = Math.min(block.length, length - offset);
+    output.set(block.subarray(0, take), offset);
+    offset += take;
+    counter += 1;
+  }
+
+  return output;
+}
+
+function captchaPickDistinct(values, randomBytes, count) {
+  const pool = values.slice();
+  const picked = [];
+  let cursor = 0;
+
+  while (picked.length < count && pool.length > 0) {
+    const high = randomBytes[cursor % randomBytes.length];
+    const low = randomBytes[(cursor + 1) % randomBytes.length];
+    cursor += 2;
+    const index = (((high << 8) | low) % pool.length);
+    picked.push(pool.splice(index, 1)[0]);
+  }
+
+  return picked;
+}
+
+async function deriveCaptchaChallenge(secret, nonceBytes) {
+  const layoutRandom = await captchaRandomBytes(secret, nonceBytes, 'layout', 64);
+  const layout = captchaPickDistinct(CONSTANTS.CAPTCHA_POOL, layoutRandom, CONSTANTS.CAPTCHA_GRID_SIZE);
+
+  const targetRandom = await captchaRandomBytes(secret, nonceBytes, 'targets', 64);
+  const targets = captchaPickDistinct(
+    layout,
+    targetRandom,
+    Math.min(CONSTANTS.CAPTCHA_TARGET_COUNT, layout.length)
+  );
+
+  return { layout, targets };
+}
+
+async function buildCaptchaToken(secret, { issuedAt, step, nonceBytes }) {
+  const payload = new Uint8Array(1 + 4 + 1 + nonceBytes.length);
+  payload[0] = CAPTCHA_TOKEN_VERSION;
+  payload[1] = (issuedAt >>> 24) & 0xff;
+  payload[2] = (issuedAt >>> 16) & 0xff;
+  payload[3] = (issuedAt >>> 8) & 0xff;
+  payload[4] = issuedAt & 0xff;
+  payload[5] = step & 0xff;
+  payload.set(nonceBytes, 6);
+
+  const mac = await captchaHmac(secret, payload);
+  const full = new Uint8Array(payload.length + CAPTCHA_MAC_BYTES);
+  full.set(payload, 0);
+  full.set(mac.subarray(0, CAPTCHA_MAC_BYTES), payload.length);
+  return bytesToBase64Url(full);
+}
+
+async function parseCaptchaToken(secret, token) {
+  try {
+    const bytes = base64UrlToBytes(token);
+    const payloadLength = 1 + 4 + 1 + CAPTCHA_NONCE_BYTES;
+    if (bytes.length !== payloadLength + CAPTCHA_MAC_BYTES) return null;
+    if (bytes[0] !== CAPTCHA_TOKEN_VERSION) return null;
+
+    const payload = bytes.subarray(0, payloadLength);
+    const providedMac = bytes.subarray(payloadLength);
+    const expectedMac = (await captchaHmac(secret, payload)).subarray(0, CAPTCHA_MAC_BYTES);
+
+    let diff = 0;
+    for (let i = 0; i < CAPTCHA_MAC_BYTES; i++) {
+      diff |= providedMac[i] ^ expectedMac[i];
+    }
+    if (diff !== 0) return null;
+
+    const issuedAt = ((payload[1] << 24) | (payload[2] << 16) | (payload[3] << 8) | payload[4]) >>> 0;
+    return { issuedAt, step: payload[5], nonceBytes: payload.subarray(6, 6 + CAPTCHA_NONCE_BYTES) };
+  } catch (error) {
+    logError('parseCaptchaToken', error);
+    return null;
+  }
+}
+
+function buildCaptchaText(env, targets, step) {
+  const timeout = getCaptchaTimeoutSeconds(env);
+  const sequence = targets.map((emoji, index) => (index < step ? '✅' : emoji)).join(' ');
+
+  let text = `🤖 *人机验证*\n请在 ${timeout} 秒内按照下面目标序列从左往右依次点击：\n\n${sequence}`;
+  if (step > 0) {
+    text += `\n\n进度: ${step}/${targets.length}，请继续点击下一个目标。`;
+  }
+  return text;
+}
+
+function buildCaptchaKeyboard(layout, token) {
+  const columns = CONSTANTS.CAPTCHA_GRID_COLUMNS;
+  const inline_keyboard = [];
+
+  for (let index = 0; index < layout.length; index += columns) {
+    inline_keyboard.push(layout.slice(index, index + columns).map((emoji, offset) => ({
+      text: emoji,
+      callback_data: `${CAPTCHA_CALLBACK_PREFIX}:${index + offset}:${token}`
+    })));
+  }
+
+  inline_keyboard.push([{
+    text: '🔄 换一题',
+    callback_data: `${CAPTCHA_CALLBACK_PREFIX}:${CAPTCHA_SEAT_REFRESH}:${token}`
+  }]);
+
+  return { inline_keyboard };
+}
+
+async function isCaptchaVerified(chatId, env) {
+  const state = await captchaStoreGet(captchaKey(chatId, 'ok'), env);
+  return !!(state && typeof state.until === 'number' && state.until > Date.now());
+}
+
+async function markCaptchaVerified(chatId, env, userInfo = null) {
+  const ttl = getCaptchaTtlSeconds(env);
+  const until = Date.now() + ttl * 1000;
+
+  await captchaStorePut(captchaKey(chatId, 'ok'), {
+    at: new Date().toISOString(),
+    until,
+    userName: userInfo ? userInfo.userName : undefined
+  }, ttl, env);
+
+  await captchaStoreDelete(captchaKey(chatId, 'fail'), env);
+  logInfo('markCaptchaVerified', 'Captcha passed', { chatId, ttlHours: getCaptchaTtlSeconds(env) / 3600 });
+  return until;
+}
+
+// 供管理员使用：清除某个用户/聊天的验证状态、失败计数与冷却锁定
+async function resetCaptchaState(chatId, env) {
+  await captchaStoreDelete(captchaKey(chatId, 'ok'), env);
+  await captchaStoreDelete(captchaKey(chatId, 'fail'), env);
+  await captchaStoreDelete(captchaKey(chatId, 'lock'), env);
+}
+
+async function getCaptchaLockRemainingMs(chatId, env) {
+  const until = await captchaStoreGet(captchaKey(chatId, 'lock'), env);
+  if (typeof until !== 'number') return 0;
+  return Math.max(0, until - Date.now());
+}
+
+async function registerCaptchaFailure(chatId, env) {
+  const key = captchaKey(chatId, 'fail');
+  const state = await captchaStoreGet(key, env);
+  const count = ((state && state.count) || 0) + 1;
+
+  if (count >= CONSTANTS.CAPTCHA_MAX_FAILURES) {
+    await captchaStorePut(key, { count: 0 }, CONSTANTS.CAPTCHA_DEFAULT_FAIL_WINDOW_SECONDS, env);
+    await captchaStorePut(
+      captchaKey(chatId, 'lock'),
+      Date.now() + CONSTANTS.CAPTCHA_LOCKOUT_SECONDS * 1000,
+      CONSTANTS.CAPTCHA_LOCKOUT_SECONDS,
+      env
+    );
+    return { locked: true, remaining: 0, lockoutMinutes: Math.ceil(CONSTANTS.CAPTCHA_LOCKOUT_SECONDS / 60) };
+  }
+
+  await captchaStorePut(key, { count }, CONSTANTS.CAPTCHA_DEFAULT_FAIL_WINDOW_SECONDS, env);
+  return { locked: false, remaining: CONSTANTS.CAPTCHA_MAX_FAILURES - count };
+}
+
+async function createCaptchaChallenge(env) {
+  const secret = getCaptchaSecret(env);
+  const nonceBytes = crypto.getRandomValues(new Uint8Array(CAPTCHA_NONCE_BYTES));
+  const issuedAt = Math.floor(Date.now() / 1000) % 4294967296;
+  const token = await buildCaptchaToken(secret, { issuedAt, step: 0, nonceBytes });
+  const { layout, targets } = await deriveCaptchaChallenge(secret, nonceBytes);
+
+  return {
+    issuedAt,
+    nonceBytes,
+    layout,
+    targets,
+    text: buildCaptchaText(env, targets, 0),
+    reply_markup: buildCaptchaKeyboard(layout, token)
+  };
+}
+
+async function sendCaptchaChallenge(chatId, env, intro = null) {
+  const lockRemainingMs = await getCaptchaLockRemainingMs(chatId, env);
+  if (lockRemainingMs > 0) {
+    const minutes = Math.max(1, Math.ceil(lockRemainingMs / 60000));
+    await sendMessage(chatId, `⏳ 验证尝试次数过多，请 ${minutes} 分钟后再发送 /verify 重新验证。`, env.BOT_TOKEN);
+    return null;
+  }
+
+  const challenge = await createCaptchaChallenge(env);
+  const text = intro ? `${intro}\n\n${challenge.text}` : challenge.text;
+  const result = await sendMessage(chatId, text, env.BOT_TOKEN, { reply_markup: challenge.reply_markup });
+  logInfo('sendCaptchaChallenge', 'Captcha challenge sent', { chatId, targets: challenge.targets });
+  return result;
+}
+
+async function safeEditCaptchaMessage(chatId, messageId, text, env, replyMarkup = null) {
+  try {
+    return await editMessageText(chatId, messageId, text, env.BOT_TOKEN, replyMarkup ? { reply_markup: replyMarkup } : {});
+  } catch (error) {
+    logError('safeEditCaptchaMessage', error, { chatId, messageId });
+    return { ok: false };
+  }
+}
+
+const CAPTCHA_EXPIRED_TEXT = '⏰ *验证已超时*\n\n请发送 /verify 重新获取验证。';
+const CAPTCHA_PASSED_TEXT = '✅ *验证通过*\n\n现在可以直接发送消息给管理员了。';
+const CAPTCHA_FAILED_TEXT = '❌ *验证未通过*\n\n请按新的验证消息重新点击。';
+
+// 处理人机验证按钮回调：cv:<座位号 或 r>:<token>
+async function handleCaptchaCallbackQuery(callbackQuery, env) {
+  const callbackQueryId = callbackQuery.id;
+  const chatId = callbackQuery.message && callbackQuery.message.chat && callbackQuery.message.chat.id;
+  const messageId = callbackQuery.message && callbackQuery.message.message_id;
+  const userId = callbackQuery.from && callbackQuery.from.id;
+
+  if (!chatId || !messageId) {
+    await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '无法定位消息', true);
+    return;
+  }
+
+  if (userId !== undefined && String(userId) !== String(chatId)) {
+    await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '请在私聊中完成验证', true);
+    return;
+  }
+
+  const parts = String(callbackQuery.data || '').split(':');
+  const seat = parts[1] || '';
+  const token = parts[2] || '';
+  const secret = getCaptchaSecret(env);
+  const parsed = await parseCaptchaToken(secret, token);
+
+  if (!parsed) {
+    await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '⚠️ 验证数据无效，请发送 /verify 重新验证', true);
+    return;
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000) % 4294967296;
+  if (nowSeconds - parsed.issuedAt > getCaptchaTimeoutSeconds(env)) {
+    await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '⏰ 验证已超时，请发送 /verify 重新验证', true);
+    await safeEditCaptchaMessage(chatId, messageId, CAPTCHA_EXPIRED_TEXT, env, { inline_keyboard: [] });
+    return;
+  }
+
+  if ((await getCaptchaLockRemainingMs(chatId, env)) > 0) {
+    await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '⏳ 尝试次数过多，请稍后再试', true);
+    return;
+  }
+
+  if (seat === CAPTCHA_SEAT_REFRESH) {
+    const challenge = await createCaptchaChallenge(env);
+    await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '🔄 已更换题目');
+    await safeEditCaptchaMessage(chatId, messageId, challenge.text, env, challenge.reply_markup);
+    return;
+  }
+
+  const { layout, targets } = await deriveCaptchaChallenge(secret, parsed.nonceBytes);
+  const seatIndex = parseInt(seat, 10);
+  const expected = targets[parsed.step];
+
+  if (!Number.isInteger(seatIndex) || seatIndex < 0 || seatIndex >= layout.length || !expected) {
+    await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '⚠️ 验证数据异常，请发送 /verify 重新验证', true);
+    return;
+  }
+
+  if (layout[seatIndex] === expected) {
+    const nextStep = parsed.step + 1;
+
+    if (nextStep >= targets.length) {
+      const userInfo = {
+        userName: (callbackQuery.from && (callbackQuery.from.username || callbackQuery.from.first_name)) || 'Unknown',
+        userId,
+        chatId
+      };
+      await markCaptchaVerified(chatId, env, userInfo);
+      await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '✅ 验证通过');
+      await safeEditCaptchaMessage(chatId, messageId, CAPTCHA_PASSED_TEXT, env, { inline_keyboard: [] });
+
+      if (env.ENABLE_USER_TRACKING === 'true') {
+        await addUserToKV(chatId, {
+          ...userInfo,
+          username: (callbackQuery.from && callbackQuery.from.username) || null,
+          lastActive: new Date().toISOString()
+        }, env);
+      }
+
+      await sendMessage(chatId, '👋 你好！我是消息转发机器人。\n\n请发送你的消息，我会转发给管理员并尽快回复你。', env.BOT_TOKEN);
+      return;
+    }
+
+    const nextToken = await buildCaptchaToken(secret, {
+      issuedAt: parsed.issuedAt,
+      step: nextStep,
+      nonceBytes: parsed.nonceBytes
+    });
+
+    await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, `✅ 正确，还剩 ${targets.length - nextStep} 个`);
+    await safeEditCaptchaMessage(
+      chatId,
+      messageId,
+      buildCaptchaText(env, targets, nextStep),
+      env,
+      buildCaptchaKeyboard(layout, nextToken)
+    );
+    return;
+  }
+
+  const failure = await registerCaptchaFailure(chatId, env);
+
+  if (failure.locked) {
+    await answerCallbackQuery(
+      callbackQueryId,
+      env.BOT_TOKEN,
+      `❌ 连续答错 ${CONSTANTS.CAPTCHA_MAX_FAILURES} 次，请 ${failure.lockoutMinutes} 分钟后再试`,
+      true
+    );
+    await safeEditCaptchaMessage(
+      chatId,
+      messageId,
+      `🔒 *验证已锁定*\n\n错误次数过多，请 ${failure.lockoutMinutes} 分钟后再发送 /verify 重新验证。`,
+      env,
+      { inline_keyboard: [] }
+    );
+    return;
+  }
+
+  await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, `❌ 顺序错误，还有 ${failure.remaining} 次机会`, true);
+  await safeEditCaptchaMessage(chatId, messageId, CAPTCHA_FAILED_TEXT, env, { inline_keyboard: [] });
+  await sendCaptchaChallenge(chatId, env);
+}
+
+// 未通过验证的用户：只允许触发验证，其余消息一律拦截
+async function handleUnverifiedUserMessage(message, userInfo, env) {
+  const text = (message.text || '').trim();
+  const lockRemainingMs = await getCaptchaLockRemainingMs(userInfo.chatId, env);
+
+  if (lockRemainingMs > 0) {
+    const minutes = Math.max(1, Math.ceil(lockRemainingMs / 60000));
+    await sendMessage(
+      userInfo.chatId,
+      `⏳ 验证尝试次数过多，请 ${minutes} 分钟后再发送 /verify 重新验证。`,
+      env.BOT_TOKEN
+    );
+    return;
+  }
+
+  if (text === '/start' || text.startsWith('/start ') || text === '/verify') {
+    await sendCaptchaChallenge(userInfo.chatId, env);
+    return;
+  }
+
+  await sendMessage(
+    userInfo.chatId,
+    '⚠️ 请先完成人机验证。\n\n请点击上方验证消息中的按钮，或发送 /verify 重新获取验证。',
+    env.BOT_TOKEN
+  );
+}
+
 // 生成 /users 分页文本与内联键盘
 function buildUsersPage(users, page, pageSize) {
   const total = users.length;
@@ -949,6 +1478,18 @@ async function handleUserMessage(message, env) {
   const userInfo = createUserInfo(message)
   
   try {
+    // 忽略其他机器人账号推送的内容，减少垃圾消息
+    if (message.from.is_bot) {
+      logInfo('handleUserMessage', 'Ignored message from bot', { userId: userInfo.userId })
+      return
+    }
+
+    // 人机验证闸门：未通过验证前，任何消息都不会转发给管理员
+    if (isCaptchaEnabled(env) && !(await isCaptchaVerified(userInfo.chatId, env))) {
+      await handleUnverifiedUserMessage(message, userInfo, env)
+      return
+    }
+
     // 自动跟踪用户（如果启用）
     if (env.ENABLE_USER_TRACKING === 'true') {
       await addUserToKV(userInfo.chatId, userInfo, env)
@@ -1037,9 +1578,10 @@ async function handleAdminMessage(message, env) {
       const userTrackingStatus = env.ENABLE_USER_TRACKING === 'true' ? '🟢 已启用' : '🔴 未启用'
       const forumModeStatus = env.ENABLE_FORUM_MODE === 'true' ? '🟢 已启用' : '🔴 未启用'
       const isForumChat = env.ENABLE_FORUM_MODE === 'true' ? await isForum(env.ADMIN_CHAT_ID, env.BOT_TOKEN) : false
+      const captchaStatus = isCaptchaEnabled(env) ? '🟢 已启用' : '🔴 未启用'
       
       await sendMessage(env.ADMIN_CHAT_ID, 
-        `🔧 *管理员面板*\n\n👋 欢迎使用消息转发机器人管理面板！\n\n📋 *可用命令:*\n• \`/status\` - 查看机器人状态\n• \`/help\` - 显示帮助信息\n• \`/post\` - 群发消息功能\n• \`/users\` - 查看用户列表（需启用用户跟踪）\n\n💡 *使用说明:*\n• 直接回复用户消息即可回复给对应用户\n• 使用 /post 命令进行消息群发\n• 论坛模式下，每个用户有独立话题\n\n📊 *系统状态:*\n• 用户跟踪: ${userTrackingStatus}\n• 论坛模式: ${forumModeStatus}${isForumChat ? ' ✅ 已检测到论坛群组' : ''}\n\n🤖 机器人已就绪，等待用户消息...`, 
+        `🔧 *管理员面板*\n\n👋 欢迎使用消息转发机器人管理面板！\n\n📋 *可用命令:*\n• \`/status\` - 查看机器人状态\n• \`/help\` - 显示帮助信息\n• \`/post\` - 群发消息功能\n• \`/users\` - 查看用户列表（需启用用户跟踪）\n• \`/reset\` - 重置指定用户的人机验证\n\n💡 *使用说明:*\n• 直接回复用户消息即可回复给对应用户\n• 使用 /post 命令进行消息群发\n• 论坛模式下，每个用户有独立话题\n\n📊 *系统状态:*\n• 用户跟踪: ${userTrackingStatus}\n• 论坛模式: ${forumModeStatus}${isForumChat ? ' ✅ 已检测到论坛群组' : ''}\n• 人机验证: ${captchaStatus}\n\n🤖 机器人已就绪，等待用户消息...`, 
         env.BOT_TOKEN, 
         { message_thread_id: message.message_thread_id }
       )
@@ -1051,6 +1593,9 @@ async function handleAdminMessage(message, env) {
         ? (await getUsersFromKV(env)).length 
         : '未启用跟踪'
       
+      const captchaStatus = isCaptchaEnabled(env)
+        ? (env.USER_STORAGE ? '🟢 已启用 (KV持久化)' : '🟡 已启用 (仅内存，建议绑定KV)')
+        : '🔴 未启用'
       const forumModeStatus = env.ENABLE_FORUM_MODE === 'true' ? '🟢 已启用' : '🔴 未启用'
       const isForumChat = env.ENABLE_FORUM_MODE === 'true' ? await isForum(env.ADMIN_CHAT_ID, env.BOT_TOKEN) : false
       
@@ -1061,7 +1606,7 @@ async function handleAdminMessage(message, env) {
       }
       
       await sendMessage(env.ADMIN_CHAT_ID, 
-        `📊 *机器人状态*\n\n🟢 状态: 运行中\n🔄 模式: 无状态转发\n👥 已跟踪用户: ${userCount}\n🗣️ 论坛模式: ${forumModeStatus}${isForumChat ? ' (论坛群组)' : ''}\n📝 用户话题: ${topicCount}\n⏰ 查询时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`, 
+        `📊 *机器人状态*\n\n🟢 状态: 运行中\n🔄 模式: 无状态转发\n👥 已跟踪用户: ${userCount}\n🛡️ 人机验证: ${captchaStatus}\n🗣️ 论坛模式: ${forumModeStatus}${isForumChat ? ' (论坛群组)' : ''}\n📝 用户话题: ${topicCount}\n⏰ 查询时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`, 
         env.BOT_TOKEN, 
         { message_thread_id: message.message_thread_id }
       )
@@ -1071,9 +1616,12 @@ async function handleAdminMessage(message, env) {
     if (message.text === '/help') {
       const forumHelp = env.ENABLE_FORUM_MODE === 'true' ? 
         `\n\n🗣️ *论坛模式:*\n• 每个用户有独立话题\n• 在话题中直接发送消息即可回复用户\n• 支持话题内的媒体消息回复` : ''
+      const captchaHelp = isCaptchaEnabled(env) ?
+        `\n\n🛡️ *人机验证:*\n• 用户首次发消息需在 ${getCaptchaTimeoutSeconds(env)} 秒内按顺序点击 Emoji 完成验证\n• 未通过验证的消息不会转发给管理员（有效 ${getCaptchaTtlSeconds(env) / 3600} 小时）\n• \`/reset 用户ID\` - 重置指定用户的验证状态与失败锁定` :
+        `\n\n🛡️ *人机验证:* 已关闭（ENABLE_CAPTCHA=false）`
       
       await sendMessage(env.ADMIN_CHAT_ID, 
-        `❓ *帮助信息*\n\n🔄 *回复用户:*\n直接回复用户的消息即可发送回复给对应用户\n\n📢 *群发消息:*\n• \`/post all 消息内容\` - 向所有用户群发（需启用用户跟踪）\n• \`/post 123,456,789 消息内容\` - 向指定用户群发\n• 回复媒体消息并使用 /post 命令可群发媒体\n\n👥 *用户管理:*\n• \`/users\` - 查看已跟踪的用户列表\n\n📝 *消息格式:*\n• 支持文本、图片、文件等各种消息类型\n• 支持Markdown格式${forumHelp}\n\n⚙️ *命令列表:*\n• \`/start\` - 显示欢迎信息\n• \`/status\` - 查看机器人状态\n• \`/help\` - 显示此帮助信息\n• \`/post\` - 群发消息功能\n• \`/users\` - 查看用户列表`, 
+        `❓ *帮助信息*\n\n🔄 *回复用户:*\n直接回复用户的消息即可发送回复给对应用户\n\n📢 *群发消息:*\n• \`/post all 消息内容\` - 向所有用户群发（需启用用户跟踪）\n• \`/post 123,456,789 消息内容\` - 向指定用户群发\n• 回复媒体消息并使用 /post 命令可群发媒体\n\n👥 *用户管理:*\n• \`/users\` - 查看已跟踪的用户列表\n\n📝 *消息格式:*\n• 支持文本、图片、文件等各种消息类型\n• 支持Markdown格式${forumHelp}${captchaHelp}\n\n⚙️ *命令列表:*\n• \`/start\` - 显示欢迎信息\n• \`/status\` - 查看机器人状态\n• \`/help\` - 显示此帮助信息\n• \`/post\` - 群发消息功能\n• \`/users\` - 查看用户列表\n• \`/reset\` - 重置用户人机验证状态`, 
         env.BOT_TOKEN, 
         { message_thread_id: message.message_thread_id }
       )
@@ -1184,6 +1732,27 @@ async function handleAdminMessage(message, env) {
         message_thread_id: message.message_thread_id,
         reply_markup
       })
+      return
+    }
+
+    if (message.text && message.text.startsWith('/reset')) {
+      const targetChatId = message.text.substring('/reset'.length).trim()
+
+      if (!/^\d+$/.test(targetChatId)) {
+        await sendMessage(env.ADMIN_CHAT_ID,
+          `🔓 *重置用户人机验证*\n\n🎯 *用法:*\n\`/reset 用户ID\`\n\n💡 *示例:*\n\`/reset 123456789\`\n\n执行后会清除该用户的验证状态、失败次数与冷却锁定，用户下次发消息需重新完成验证。`,
+          env.BOT_TOKEN,
+          { message_thread_id: message.message_thread_id }
+        )
+        return
+      }
+
+      await resetCaptchaState(targetChatId, env)
+      await sendMessage(env.ADMIN_CHAT_ID,
+        `✅ 已重置用户 \`${targetChatId}\` 的人机验证状态\n\n该用户下次发送消息时需要重新完成验证。`,
+        env.BOT_TOKEN,
+        { message_thread_id: message.message_thread_id }
+      )
       return
     }
 
@@ -1429,10 +1998,12 @@ async function handleWebhook(request, env, ctx) {
       // 使用 ctx.waitUntil 进行后台消息处理，不阻塞响应
       ctx.waitUntil(handleMessage(update.message, env))
     } else if (update.callback_query) {
-      // 内联按钮回调处理（仅用于 /users 分页）
+      // 内联按钮回调处理：人机验证 + /users 分页
       const cq = update.callback_query;
       const data = cq.data || '';
-      if (data && data.startsWith('users:')) {
+      if (data.startsWith(`${CAPTCHA_CALLBACK_PREFIX}:`)) {
+        ctx.waitUntil(handleCaptchaCallbackQuery(cq, env));
+      } else if (data.startsWith('users:')) {
         ctx.waitUntil(handleUsersCallbackQuery(cq, env));
       }
     }

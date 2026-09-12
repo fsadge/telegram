@@ -34,7 +34,7 @@ const CONSTANTS = {
   ],
   CAPTCHA_GRID_SIZE: 9,
   CAPTCHA_GRID_COLUMNS: 3,
-  CAPTCHA_TARGET_COUNT: 3,
+  CAPTCHA_TARGET_COUNT: 5,
   CAPTCHA_DEFAULT_TIMEOUT_SECONDS: 180,
   CAPTCHA_DEFAULT_TTL_HOURS: 720,
   CAPTCHA_DEFAULT_FAIL_WINDOW_SECONDS: 600,
@@ -829,7 +829,8 @@ async function answerCallbackQuery(callbackQueryId, botToken, text = '', showAle
 }
 
 // ==================== 人机验证（Emoji 序列点击验证） ====================
-// 形式：9宫格 Emoji 内联按钮 + 目标序列，要求在限时内按序列从左往右依次点击。
+// 形式：9宫格 Emoji 内联按钮 + 5 个目标序列，要求在限时内按序列依次点击；
+//       点击方向随机为「从左往右」或「从右往左」，仅私聊可用。
 // 实现要点：
 //   1. 题库、目标序列与签名全部由随机 nonce 派生，回调数据自带签名与过期时间，天然无状态；
 //   2. 验证结果与失败次数写入 KV（USER_STORAGE），未绑定时降级为实例内存并在日志中告警；
@@ -1017,7 +1018,11 @@ async function deriveCaptchaChallenge(secret, nonceBytes) {
     Math.min(CONSTANTS.CAPTCHA_TARGET_COUNT, layout.length)
   );
 
-  return { layout, targets };
+  // 点击方向随机：从左往右 或 从右往左（同样由 nonce 派生，保证无状态可重建）
+  const directionRandom = await captchaRandomBytes(secret, nonceBytes, 'direction', 1);
+  const direction = directionRandom[0] % 2 === 0 ? 'ltr' : 'rtl';
+
+  return { layout, targets, direction };
 }
 
 async function buildCaptchaToken(secret, { issuedAt, step, nonceBytes }) {
@@ -1062,11 +1067,17 @@ async function parseCaptchaToken(secret, token) {
   }
 }
 
-function buildCaptchaText(env, targets, step) {
+function buildCaptchaText(env, targets, step, direction = 'ltr') {
   const timeout = getCaptchaTimeoutSeconds(env);
-  const sequence = targets.map((emoji, index) => (index < step ? '✅' : emoji)).join(' ');
+  // 从右往左时，展示顺序与点击顺序相反（最右边的目标最先点）
+  const displayed = direction === 'rtl' ? targets.slice().reverse() : targets;
+  const sequence = displayed.map((emoji, index) => {
+    const done = direction === 'rtl' ? index >= displayed.length - step : index < step;
+    return done ? '✅' : emoji;
+  }).join(' ');
+  const arrowText = direction === 'rtl' ? '从右往左' : '从左往右';
 
-  let text = `🤖 *人机验证*\n请在 ${timeout} 秒内按照下面目标序列从左往右依次点击：\n\n${sequence}`;
+  let text = `🤖 *人机验证*\n请在 ${timeout} 秒内按照下面目标序列${arrowText}依次点击：\n\n${sequence}`;
   if (step > 0) {
     text += `\n\n进度: ${step}/${targets.length}，请继续点击下一个目标。`;
   }
@@ -1150,14 +1161,15 @@ async function createCaptchaChallenge(env) {
   const nonceBytes = crypto.getRandomValues(new Uint8Array(CAPTCHA_NONCE_BYTES));
   const issuedAt = Math.floor(Date.now() / 1000) % 4294967296;
   const token = await buildCaptchaToken(secret, { issuedAt, step: 0, nonceBytes });
-  const { layout, targets } = await deriveCaptchaChallenge(secret, nonceBytes);
+  const { layout, targets, direction } = await deriveCaptchaChallenge(secret, nonceBytes);
 
   return {
     issuedAt,
     nonceBytes,
     layout,
     targets,
-    text: buildCaptchaText(env, targets, 0),
+    direction,
+    text: buildCaptchaText(env, targets, 0, direction),
     reply_markup: buildCaptchaKeyboard(layout, token)
   };
 }
@@ -1193,7 +1205,8 @@ const CAPTCHA_FAILED_TEXT = '❌ *验证未通过*\n\n请按新的验证消息�
 // 处理人机验证按钮回调：cv:<座位号 或 r>:<token>
 async function handleCaptchaCallbackQuery(callbackQuery, env) {
   const callbackQueryId = callbackQuery.id;
-  const chatId = callbackQuery.message && callbackQuery.message.chat && callbackQuery.message.chat.id;
+  const chat = (callbackQuery.message && callbackQuery.message.chat) || null;
+  const chatId = chat && chat.id;
   const messageId = callbackQuery.message && callbackQuery.message.message_id;
   const userId = callbackQuery.from && callbackQuery.from.id;
 
@@ -1202,7 +1215,14 @@ async function handleCaptchaCallbackQuery(callbackQuery, env) {
     return;
   }
 
-  if (userId !== undefined && String(userId) !== String(chatId)) {
+  // 人机验证只在私聊中进行：群组/频道内的按钮（含被转发出去的验证消息）一律拒绝
+  const isGroupChat = !!chat.type && chat.type !== 'private';
+  if (isGroupChat || String(userId) !== String(chatId)) {
+    logInfo('handleCaptchaCallbackQuery', 'Rejected captcha click outside private chat', {
+      chatId,
+      chatType: chat.type,
+      userId
+    });
     await answerCallbackQuery(callbackQueryId, env.BOT_TOKEN, '请在私聊中完成验证', true);
     return;
   }
@@ -1237,7 +1257,7 @@ async function handleCaptchaCallbackQuery(callbackQuery, env) {
     return;
   }
 
-  const { layout, targets } = await deriveCaptchaChallenge(secret, parsed.nonceBytes);
+  const { layout, targets, direction } = await deriveCaptchaChallenge(secret, parsed.nonceBytes);
   const seatIndex = parseInt(seat, 10);
   const expected = targets[parsed.step];
 
@@ -1281,7 +1301,7 @@ async function handleCaptchaCallbackQuery(callbackQuery, env) {
     await safeEditCaptchaMessage(
       chatId,
       messageId,
-      buildCaptchaText(env, targets, nextStep),
+      buildCaptchaText(env, targets, nextStep, direction),
       env,
       buildCaptchaKeyboard(layout, nextToken)
     );
@@ -1935,6 +1955,32 @@ async function handleAdminMessage(message, env) {
   }
 }
 
+// 群组/频道内的非管理员消息：人机验证无法在群内完成，因此不转发，仅引导私聊
+async function handleGroupChatMessage(message, env) {
+  const text = (message.text || '').trim()
+
+  if (text === '/start' || text.startsWith('/start ') || text === '/verify' || text === '/help') {
+    try {
+      await sendMessage(
+        message.chat.id,
+        '👤 请私聊机器人发送消息。\n\n人机验证需要在私聊中完成，群组内的消息不会被转发给管理员。',
+        env.BOT_TOKEN,
+        {
+          reply_to_message_id: message.message_id,
+          message_thread_id: message.message_thread_id
+        }
+      )
+    } catch (error) {
+      logError('handleGroupChatMessage', error, { chatId: message.chat.id })
+    }
+  }
+
+  logInfo('handleGroupChatMessage', 'Ignored message from non-private chat', {
+    chatId: message.chat.id,
+    chatType: message.chat.type
+  })
+}
+
 // 处理消息
 async function handleMessage(message, env) {
   // 输入验证
@@ -1947,11 +1993,16 @@ async function handleMessage(message, env) {
   const userId = message.from.id
   const userName = message.from.username || message.from.first_name || 'Unknown'
   const isAdmin = chatId.toString() === env.ADMIN_CHAT_ID.toString()
+  const chatType = message.chat.type
+  const isPrivateChat = chatType === 'private' || (!chatType && chatId > 0)
 
   console.log(`收到消息: 来自 ${userName} (${userId}) 在聊天 ${chatId}`)
 
   if (isAdmin) {
     await handleAdminMessage(message, env)
+  } else if (!isPrivateChat && isCaptchaEnabled(env)) {
+    // 群组/频道内无法完成人机验证，因此不转发，仅引导用户私聊机器人
+    await handleGroupChatMessage(message, env)
   } else {
     await handleUserMessage(message, env)
   }

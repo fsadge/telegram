@@ -192,9 +192,9 @@ graph TB
 
 <div align="center">
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/fsadge/cftgsx)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/fsadge/telegram.git)
 
-**[点击上方按钮一键部署到Cloudflare Workers](https://deploy.workers.cloudflare.com/?url=https://github.com/fsadge/cftgsx)**
+**[点击上方按钮一键部署到Cloudflare Workers](https://deploy.workers.cloudflare.com/?url=https://github.com/fsadge/telegram.git)**
 
 </div>
 
